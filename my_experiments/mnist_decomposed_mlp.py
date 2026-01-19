@@ -24,14 +24,66 @@ from torchvision import datasets, transforms
 from tqdm import tqdm
 
 from spd.log import logger
-from spd.metrics.alive_components import AliveComponentsTracker
 from spd.metrics.importance_minimality_loss import importance_minimality_loss
 from spd.models.components import LinearCiFn, MLPCiFn
 from spd.models.sigmoids import SIGMOID_TYPES
-from spd.utils.component_utils import calc_ci_l_zero
 from spd.utils.distributed_utils import get_device
 from spd.utils.general_utils import set_seed
 from spd.utils.module_utils import init_param_
+
+
+class AliveTracker:
+    """Track which components are alive based on recent mask activity.
+
+    A component is considered alive if it has been active (mask > threshold) within
+    the last n_batches_until_dead batches.
+    """
+
+    def __init__(
+        self,
+        module_to_c: dict[str, int],
+        device: str,
+        n_batches_until_dead: int,
+        threshold: float = 0.5,
+    ):
+        self.n_batches_until_dead = n_batches_until_dead
+        self.threshold = threshold
+        self.n_batches_since_active: dict[str, Tensor] = {
+            name: torch.zeros(c, dtype=torch.int64, device=device)
+            for name, c in module_to_c.items()
+        }
+
+    def update(self, masks: dict[str, Float[Tensor, "... C"]]) -> None:
+        """Update tracking based on mask values from a batch."""
+        for name, mask in masks.items():
+            # Component is active if mask > threshold for any sample in batch
+            # threshold=0.5 works for both binary (0/1) and soft masks
+            active = (mask > self.threshold).any(dim=0)  # (C,)
+            self.n_batches_since_active[name] = torch.where(
+                active,
+                torch.zeros_like(self.n_batches_since_active[name]),
+                self.n_batches_since_active[name] + 1,
+            )
+
+    def compute(self) -> dict[str, int]:
+        """Return number of alive components per module."""
+        return {
+            name: int((counts < self.n_batches_until_dead).sum().item())
+            for name, counts in self.n_batches_since_active.items()
+        }
+
+
+def calc_l0(mask: Float[Tensor, "... C"]) -> float:
+    """Calculate L0: average number of active components per sample.
+
+    Args:
+        mask: Component mask with shape (..., C). Binary for Bernoulli sampling,
+              soft values for deterministic.
+
+    Returns:
+        Average number of active components per sample (sum of mask values).
+    """
+    return mask.sum(-1).mean().item()
 
 
 class DecomposedLinear(nn.Module):
@@ -52,11 +104,13 @@ class DecomposedLinear(nn.Module):
         C: int,
         ci_fn_type: str,
         ci_fn_hidden_dims: list[int],
+        use_normal_sigmoid: bool,
     ):
         super().__init__()
         self.d_in = d_in
         self.d_out = d_out
         self.C = C
+        self.use_normal_sigmoid = use_normal_sigmoid
 
         # Component matrices
         self.V = nn.Parameter(torch.empty(d_in, C))
@@ -76,8 +130,11 @@ class DecomposedLinear(nn.Module):
             raise ValueError(f"Unknown ci_fn_type: {ci_fn_type}")
 
         # Sigmoid functions for CI
-        self.lower_leaky_fn = SIGMOID_TYPES["lower_leaky_hard"]
-        self.upper_leaky_fn = SIGMOID_TYPES["upper_leaky_hard"]
+        if use_normal_sigmoid:
+            self.sigmoid_fn = torch.sigmoid
+        else:
+            self.lower_leaky_fn = SIGMOID_TYPES["lower_leaky_hard"]
+            self.upper_leaky_fn = SIGMOID_TYPES["upper_leaky_hard"]
 
     @property
     def weight(self) -> Float[Tensor, "d_out d_in"]:
@@ -92,17 +149,20 @@ class DecomposedLinear(nn.Module):
         self,
         x: Float[Tensor, "... d_in"],
         sampling: str,
-        return_ci: bool,
-    ) -> Float[Tensor, "... d_out"] | tuple[Float[Tensor, "... d_out"], Float[Tensor, "... C"]]:
+        return_extras: bool,
+    ) -> (
+        Float[Tensor, "... d_out"]
+        | tuple[Float[Tensor, "... d_out"], Float[Tensor, "... C"], Float[Tensor, "... C"]]
+    ):
         """Forward pass with optional stochastic component sampling.
 
         Args:
             x: Input tensor
             sampling: "none" for deterministic, "bernoulli" for stochastic sampling
-            return_ci: Whether to return CI values
+            return_extras: Whether to return CI values and mask
 
         Returns:
-            Output tensor, and optionally CI values
+            Output tensor, and optionally (ci_for_loss, mask)
         """
         # Get component activations
         component_acts = self.get_component_acts(x)  # (... C)
@@ -110,18 +170,31 @@ class DecomposedLinear(nn.Module):
         # Compute CI values
         ci_pre_sigmoid = self.ci_fn(component_acts)  # (... C)
 
-        if sampling == "bernoulli":
-            # Stochastic sampling: sample from Bernoulli with CI as probability
-            # Use reparameterization trick for gradients
-            ci_for_sampling = 1.05 * ci_pre_sigmoid - 0.05 * torch.rand_like(ci_pre_sigmoid)
-            ci_lower = self.lower_leaky_fn(ci_for_sampling)
-            mask = torch.bernoulli(ci_lower)
-        elif sampling == "none":
-            # Deterministic: use soft CI values
-            ci_lower = self.lower_leaky_fn(ci_pre_sigmoid)
-            mask = ci_lower
+        if self.use_normal_sigmoid:
+            # Normal sigmoid for both masking and loss
+            ci = self.sigmoid_fn(ci_pre_sigmoid)
+            if sampling == "bernoulli":
+                mask = torch.bernoulli(ci)
+            elif sampling == "none":
+                mask = ci
+            else:
+                raise ValueError(f"Unknown sampling: {sampling}")
+            ci_for_loss = ci
         else:
-            raise ValueError(f"Unknown sampling: {sampling}")
+            # Leaky hard sigmoids (SPD default)
+            if sampling == "bernoulli":
+                # Stochastic sampling: sample from Bernoulli with CI as probability
+                # Use reparameterization trick for gradients
+                ci_for_sampling = 1.05 * ci_pre_sigmoid - 0.05 * torch.rand_like(ci_pre_sigmoid)
+                ci_lower = self.lower_leaky_fn(ci_for_sampling)
+                mask = torch.bernoulli(ci_lower)
+            elif sampling == "none":
+                # Deterministic: use soft CI values
+                ci_lower = self.lower_leaky_fn(ci_pre_sigmoid)
+                mask = ci_lower
+            else:
+                raise ValueError(f"Unknown sampling: {sampling}")
+            ci_for_loss = self.upper_leaky_fn(ci_pre_sigmoid)
 
         # Apply mask to component activations
         masked_acts = component_acts * mask  # (... C)
@@ -129,9 +202,8 @@ class DecomposedLinear(nn.Module):
         # Project to output
         out = einops.einsum(masked_acts, self.U, "... C, C d_out -> ... d_out") + self.bias
 
-        if return_ci:
-            ci_upper = self.upper_leaky_fn(ci_pre_sigmoid)
-            return out, ci_upper
+        if return_extras:
+            return out, ci_for_loss, mask
 
         return out
 
@@ -150,6 +222,7 @@ class DecomposedMLP(nn.Module):
         n_components: int,
         ci_fn_type: str,
         ci_fn_hidden_dims: list[int],
+        use_normal_sigmoid: bool,
     ):
         super().__init__()
         self.fc1 = DecomposedLinear(
@@ -158,6 +231,7 @@ class DecomposedMLP(nn.Module):
             C=n_components,
             ci_fn_type=ci_fn_type,
             ci_fn_hidden_dims=ci_fn_hidden_dims,
+            use_normal_sigmoid=use_normal_sigmoid,
         )
         self.fc2 = DecomposedLinear(
             d_in=hidden_size,
@@ -165,35 +239,36 @@ class DecomposedMLP(nn.Module):
             C=n_components,
             ci_fn_type=ci_fn_type,
             ci_fn_hidden_dims=ci_fn_hidden_dims,
+            use_normal_sigmoid=use_normal_sigmoid,
         )
 
     def forward(
         self,
         x: torch.Tensor,
         sampling: str,
-        return_ci: bool,
-    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        return_extras: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """Forward pass.
 
         Args:
             x: Input tensor (batch, 784) or (batch, 1, 28, 28)
             sampling: "none" for deterministic, "bernoulli" for stochastic
-            return_ci: Whether to return CI values for each layer
+            return_extras: Whether to return CI values and masks for each layer
 
         Returns:
-            Logits, and optionally dict of CI values per layer
+            Logits, and optionally (dict of CI values, dict of masks) per layer
         """
         x = x.view(x.size(0), -1)  # Flatten
 
-        if return_ci:
-            h, ci1 = self.fc1(x, sampling=sampling, return_ci=True)
+        if return_extras:
+            h, ci1, mask1 = self.fc1(x, sampling=sampling, return_extras=True)
             h = F.relu(h)
-            out, ci2 = self.fc2(h, sampling=sampling, return_ci=True)
-            return out, {"fc1": ci1, "fc2": ci2}
+            out, ci2, mask2 = self.fc2(h, sampling=sampling, return_extras=True)
+            return out, {"fc1": ci1, "fc2": ci2}, {"fc1": mask1, "fc2": mask2}
         else:
-            h = self.fc1(x, sampling=sampling, return_ci=False)
+            h = self.fc1(x, sampling=sampling, return_extras=False)
             h = F.relu(h)
-            out = self.fc2(h, sampling=sampling, return_ci=False)
+            out = self.fc2(h, sampling=sampling, return_extras=False)
             return out
 
 
@@ -210,8 +285,7 @@ def train_decomposed_mlp(
     p_anneal_final_p: float,
     p_anneal_end_frac: float,
     sampling: str,
-    ci_alive_threshold: float,
-    n_examples_until_dead: int,
+    n_batches_until_dead: int,
     log_wandb: bool,
 ) -> int:
     """Train the decomposed MLP on MNIST.
@@ -229,8 +303,7 @@ def train_decomposed_mlp(
         p_anneal_final_p: Final p value after annealing
         p_anneal_end_frac: Fraction of training to finish annealing p
         sampling: "bernoulli" for stochastic, "none" for deterministic
-        ci_alive_threshold: CI threshold above which a component is considered firing
-        n_examples_until_dead: Number of examples without firing before component is dead
+        n_batches_until_dead: Batches without activity before component is considered dead
         log_wandb: Whether to log to W&B
 
     Returns:
@@ -240,14 +313,11 @@ def train_decomposed_mlp(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
 
-    # Initialize alive components tracker
-    batch_size = train_loader.batch_size or 64
-    alive_tracker = AliveComponentsTracker(
+    # Initialize alive tracker (uses masks, not CI threshold)
+    alive_tracker = AliveTracker(
         module_to_c={"fc1": model.fc1.C, "fc2": model.fc2.C},
         device=device,
-        n_examples_until_dead=n_examples_until_dead,
-        ci_alive_threshold=ci_alive_threshold,
-        global_n_examples_per_batch=batch_size,
+        n_batches_until_dead=n_batches_until_dead,
     )
 
     logger.info(f"Training decomposed MLP for {epochs} epochs...")
@@ -273,8 +343,8 @@ def train_decomposed_mlp(
 
             optimizer.zero_grad()
 
-            # Forward pass with CI values
-            outputs, ci_values = model(images, sampling=sampling, return_ci=True)
+            # Forward pass with CI values and masks
+            outputs, ci_values, masks = model(images, sampling=sampling, return_extras=True)
 
             # CE loss
             ce_loss = criterion(outputs, labels)
@@ -303,16 +373,16 @@ def train_decomposed_mlp(
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
 
-            # Compute CI and L0 metrics per layer
-            n_components_fc1 = ci_values["fc1"].shape[-1]
-            n_components_fc2 = ci_values["fc2"].shape[-1]
+            # Compute L0 from masks (actual active components)
+            n_components_fc1 = masks["fc1"].shape[-1]
+            n_components_fc2 = masks["fc2"].shape[-1]
 
-            l0_fc1 = calc_ci_l_zero(ci_values["fc1"], threshold=ci_alive_threshold)
-            l0_fc2 = calc_ci_l_zero(ci_values["fc2"], threshold=ci_alive_threshold)
+            l0_fc1 = calc_l0(masks["fc1"])
+            l0_fc2 = calc_l0(masks["fc2"])
             l0_total = l0_fc1 + l0_fc2
 
-            # Update alive tracker and get alive counts
-            alive_tracker.update(ci_values)
+            # Update alive tracker (uses masks)
+            alive_tracker.update(masks)
             alive_counts = alive_tracker.compute()
             n_alive_fc1 = alive_counts["fc1"]
             n_alive_fc2 = alive_counts["fc2"]
@@ -378,12 +448,8 @@ def evaluate(
     test_loader: DataLoader,
     device: str,
     sampling: str,
-    ci_alive_threshold: float,
 ) -> dict[str, float]:
     """Evaluate the model on test set.
-
-    Args:
-        ci_alive_threshold: CI threshold above which a component is considered firing
 
     Returns:
         Dict with accuracy, L0, alive_pct, and CI metrics per layer.
@@ -399,30 +465,32 @@ def evaluate(
     n_components_fc1 = model.fc1.C
     n_components_fc2 = model.fc2.C
 
-    # Track which components have fired at least once across all test samples
-    ever_fired_fc1 = torch.zeros(n_components_fc1, dtype=torch.bool, device=device)
-    ever_fired_fc2 = torch.zeros(n_components_fc2, dtype=torch.bool, device=device)
+    # Track which components have been active at least once (mask > 0.5)
+    # Using 0.5 threshold works for both binary masks and soft masks
+    ever_active_fc1 = torch.zeros(n_components_fc1, dtype=torch.bool, device=device)
+    ever_active_fc2 = torch.zeros(n_components_fc2, dtype=torch.bool, device=device)
+    active_threshold = 0.5
 
     with torch.no_grad():
         for images, labels in test_loader:
             images = images.to(device)
             labels = labels.to(device)
 
-            outputs, ci_values = model(images, sampling=sampling, return_ci=True)
+            outputs, ci_values, masks = model(images, sampling=sampling, return_extras=True)
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
 
-            # Track L0 and CI per layer
-            l0_fc1_sum += calc_ci_l_zero(ci_values["fc1"], threshold=ci_alive_threshold)
-            l0_fc2_sum += calc_ci_l_zero(ci_values["fc2"], threshold=ci_alive_threshold)
+            # Track L0 from masks (actual active components)
+            l0_fc1_sum += calc_l0(masks["fc1"])
+            l0_fc2_sum += calc_l0(masks["fc2"])
             ci_fc1_sum += ci_values["fc1"].mean().item()
             ci_fc2_sum += ci_values["fc2"].mean().item()
             n_batches += 1
 
-            # Update ever_fired masks (component fired if CI > threshold on any sample)
-            ever_fired_fc1 |= (ci_values["fc1"] > ci_alive_threshold).any(dim=0)
-            ever_fired_fc2 |= (ci_values["fc2"] > ci_alive_threshold).any(dim=0)
+            # Update ever_active masks (component active if mask > threshold on any sample)
+            ever_active_fc1 |= (masks["fc1"] > active_threshold).any(dim=0)
+            ever_active_fc2 |= (masks["fc2"] > active_threshold).any(dim=0)
 
     accuracy = 100.0 * correct / total
     l0_fc1 = l0_fc1_sum / n_batches
@@ -430,9 +498,9 @@ def evaluate(
     mean_ci_fc1 = ci_fc1_sum / n_batches
     mean_ci_fc2 = ci_fc2_sum / n_batches
 
-    # Alive = fired at least once across all test samples
-    n_alive_fc1 = ever_fired_fc1.sum().item()
-    n_alive_fc2 = ever_fired_fc2.sum().item()
+    # Alive = active at least once across all test samples
+    n_alive_fc1 = ever_active_fc1.sum().item()
+    n_alive_fc2 = ever_active_fc2.sum().item()
 
     return {
         "accuracy": accuracy,
@@ -507,7 +575,7 @@ def plot_ci_distribution(
     with torch.no_grad():
         for images, _ in test_loader:
             images = images.to(device)
-            _, ci_values = model(images, sampling="none", return_ci=True)
+            _, ci_values, _ = model(images, sampling="none", return_extras=True)
             all_ci_fc1.append(ci_values["fc1"].cpu())
             all_ci_fc2.append(ci_values["fc2"].cpu())
 
@@ -551,19 +619,19 @@ def main(
     hidden_size: int = 128,
     n_components: int = 500,
     batch_size: int = 1024,
-    epochs: int = 500,
+    epochs: int = 3000,
     lr: float = 0.001,
-    weight_decay: float = 1e-6,
-    importance_coeff: float = 5e-9,
+    weight_decay: float = 1e-5,
+    importance_coeff: float = 3e-9,
     pnorm: float = 1.0,
     p_anneal_start_frac: float = 0.0,
-    p_anneal_final_p: float = 2.0,
+    p_anneal_final_p: float = 1.0,
     p_anneal_end_frac: float = 0.5,
     sampling: str = "bernoulli",
     ci_fn_type: str = "linear",
     ci_fn_hidden_dims: list[int] | None = None,
-    ci_alive_threshold: float = 0.01,
-    n_examples_until_dead: int = 10000,
+    use_normal_sigmoid: bool = False,
+    n_batches_until_dead: int = 100,
     seed: int = 42,
     output_dir: str | None = None,
     wandb_project: str | None = "mnist_predecomposed_mlp",
@@ -585,8 +653,8 @@ def main(
         sampling: "bernoulli" for stochastic, "none" for deterministic
         ci_fn_type: "linear" or "mlp"
         ci_fn_hidden_dims: Hidden dimensions for CI MLP (None uses defaults)
-        ci_alive_threshold: CI threshold above which a component is considered firing
-        n_examples_until_dead: Examples without firing before component is considered dead
+        use_normal_sigmoid: Use normal sigmoid instead of leaky hard sigmoids
+        n_batches_until_dead: Batches without activity before component is considered dead
         seed: Random seed
         output_dir: Output directory
         wandb_project: W&B project name (None to disable)
@@ -631,8 +699,8 @@ def main(
                 "sampling": sampling,
                 "ci_fn_type": ci_fn_type,
                 "ci_fn_hidden_dims": ci_fn_hidden_dims,
-                "ci_alive_threshold": ci_alive_threshold,
-                "n_examples_until_dead": n_examples_until_dead,
+                "use_normal_sigmoid": use_normal_sigmoid,
+                "n_batches_until_dead": n_batches_until_dead,
                 "seed": seed,
             },
         )
@@ -656,6 +724,7 @@ def main(
         n_components=n_components,
         ci_fn_type=ci_fn_type,
         ci_fn_hidden_dims=ci_fn_hidden_dims_resolved,
+        use_normal_sigmoid=use_normal_sigmoid,
     )
     model = model.to(device)
 
@@ -673,16 +742,13 @@ def main(
         p_anneal_final_p=p_anneal_final_p,
         p_anneal_end_frac=p_anneal_end_frac,
         sampling=sampling,
-        ci_alive_threshold=ci_alive_threshold,
-        n_examples_until_dead=n_examples_until_dead,
+        n_batches_until_dead=n_batches_until_dead,
         log_wandb=wandb_project is not None,
     )
 
     # Evaluate
     logger.info("Evaluating on test set...")
-    test_metrics = evaluate(
-        model, test_loader, device, sampling="none", ci_alive_threshold=ci_alive_threshold
-    )
+    test_metrics = evaluate(model, test_loader, device, sampling="none")
     logger.info(f"Test accuracy: {test_metrics['accuracy']:.2f}%")
     logger.info(
         f"L0 (active components): fc1={test_metrics['l0_fc1']:.1f}, "
