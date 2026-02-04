@@ -22,19 +22,15 @@ from tqdm import tqdm
 
 from spd.configs import (
     CI_L0Config,
-    CIHistogramsConfig,
     CIMeanPerComponentConfig,
-    ComponentActivationDensityConfig,
     Config,
     FaithfulnessLossConfig,
     ImportanceMinimalityLossConfig,
-    PGDReconSubsetLossConfig,
+    # PGDReconSubsetLossConfig,  # Disabled for conv layers
     ScheduleConfig,
-    StochasticAccuracyLayerwiseConfig,
-    StochasticReconLayerwiseLossConfig,
+    StaticProbabilityRoutingConfig,
     StochasticReconSubsetLossConfig,
     TMSTaskConfig,
-    UVPlotsConfig,
 )
 from spd.log import logger
 from spd.models.component_model import ComponentModel
@@ -46,17 +42,16 @@ from spd.utils.module_utils import expand_module_patterns
 from spd.utils.run_utils import ExecutionStamp, save_file
 
 
-class ShapesTargetDataset:
-    """Dataset that generates (input, target_output) pairs for decomposition.
+class ShapesFullModelDataset:
+    """Dataset that generates (input, target_output) pairs for full model decomposition.
 
-    For the shapes network, inputs are flattened conv features and targets
-    are the concatenated logits [shape_logits, color_logits, size_logits].
+    Inputs are raw images and targets are concatenated logits.
     """
 
     def __init__(
         self,
         shapes_dataset: MultiAttributeShapesDataset,
-        model: MultiAttributeCNNSingleHead,
+        model: nn.Module,
         device: str,
         size: int = 100000,
     ):
@@ -73,43 +68,51 @@ class ShapesTargetDataset:
         """Generate a batch of (input, target_output) pairs.
 
         Returns:
-            inputs: Flattened conv features (batch, flat_size)
+            inputs: Raw images (batch, 3, 32, 32)
             targets: Concatenated logits (batch, n_shapes + n_colors + n_sizes)
         """
-        # Sample random indices from dataset
         indices = torch.randint(0, len(self.shapes_dataset), (batch_size,))
 
-        # Get images
         images = []
         for idx in indices:
             image, _ = self.shapes_dataset[int(idx)]
             images.append(image)
         images = torch.stack(images).to(self.device)
 
-        # Get conv features (input to MLP)
         with torch.no_grad():
-            x = self.model.pool(F.relu(self.model.conv1(images)))
-            x = self.model.pool(F.relu(self.model.conv2(x)))
-            x = self.model.pool(F.relu(self.model.conv3(x)))
-            conv_features = x.view(x.size(0), -1)  # Flatten
+            target_logits = self.model(images)
 
-            # Get full model output as target
-            outputs = self.model(images)
-            # Concatenate all logits
-            target_logits = torch.cat([outputs["shape"], outputs["color"], outputs["size"]], dim=1)
-
-        return conv_features, target_logits
+        return images, target_logits
 
 
-class ShapesMLP(nn.Module):
-    """Just the MLP part of the shapes CNN for decomposition."""
+class ShapesCNNWrapper(nn.Module):
+    """Wrapper around MultiAttributeCNNSingleHead that outputs a single tensor.
 
-    def __init__(self, flat_size: int, hidden_dim: int, output_dim: int):
+    SPD requires models to output a single tensor, not a dict.
+    This wrapper uses the underlying model's layers directly and concatenates outputs.
+    """
+
+    def __init__(self, model: MultiAttributeCNNSingleHead):
         super().__init__()
-        self.fc1 = nn.Linear(flat_size, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        # Expose the model's layers directly so SPD can target them
+        self.conv1 = model.conv1
+        self.conv2 = model.conv2
+        self.pool = model.pool
+        self.fc1 = model.fc1
+        self.fc2 = model.fc2
+
+        # Keep metadata for reference
+        self.n_shapes = model.n_shapes
+        self.n_colors = model.n_colors
+        self.n_sizes = model.n_sizes
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Conv backbone
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+
+        # Flatten and MLP
+        x = x.reshape(x.size(0), -1)
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
         return x
@@ -119,10 +122,10 @@ def train_shapes_model(
     model: MultiAttributeCNNSingleHead,
     train_loader: DataLoader,
     device: str,
-    epochs: int = 20,
-    lr: float = 0.001,
-    weight_decay: float = 0.0,
-    log_wandb: bool = False,
+    epochs: int,
+    lr: float,
+    weight_decay: float,
+    log_wandb: bool,
 ) -> int:
     """Train the shapes CNN.
 
@@ -200,17 +203,17 @@ def train_shapes_model(
 
 def main(
     hidden_dim: int = 64,
-    train_epochs: int = 20,
+    train_epochs: int = 50,
     train_lr: float = 0.001,
     train_weight_decay: float = 5e-4,
-    spd_steps: int = 500000,
+    spd_steps: int = 1000000,
     spd_lr: float = 0.001,
-    n_components: int = 500,
+    n_components: int = 100,
     seed: int = 42,
     n_train_samples: int = 10000,
     n_test_samples: int = 2000,
     output_dir: str | None = None,
-    wandb_project: str | None = "shapes_decomposition",
+    wandb_project: str | None = "shapes_decomposition_v7",
 ) -> None:
     """Main experiment function.
 
@@ -235,7 +238,7 @@ def main(
 
     # Setup output directory
     if output_dir is None:
-        output_dir = "./output/shapes_decomposition"
+        output_dir = "./output/shapes_decomposition_v7"
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
@@ -340,69 +343,64 @@ def main(
     if wandb_project:
         wandb.save(str(full_model_path), base_path=str(out_path), policy="now")
 
-    # Now create the MLP-only model for decomposition
-    logger.info("Creating MLP model for decomposition...")
-    output_dim = full_model.n_shapes + full_model.n_colors + full_model.n_sizes  # 8
-    mlp_model = ShapesMLP(
-        flat_size=full_model.flat_size,
-        hidden_dim=hidden_dim,
-        output_dim=output_dim,
-    )
+    # Create wrapper model for decomposition (outputs single tensor instead of dict)
+    logger.info("Creating wrapper model for full network decomposition...")
+    target_model = ShapesCNNWrapper(full_model).to(device)
+    target_model.eval()
+    target_model.requires_grad_(False)
 
-    # Copy weights from full model
-    mlp_model.fc1.weight.data = full_model.fc1.weight.data.clone()
-    mlp_model.fc1.bias.data = full_model.fc1.bias.data.clone()
-    mlp_model.fc2.weight.data = full_model.fc2.weight.data.clone()
-    mlp_model.fc2.bias.data = full_model.fc2.bias.data.clone()
-    mlp_model = mlp_model.to(device)
-    mlp_model.eval()
-    mlp_model.requires_grad_(False)
-
-    # Create datasets for SPD (using conv features as inputs)
-    train_target_dataset = ShapesTargetDataset(train_dataset, full_model, device, size=50000)
-    eval_target_dataset = ShapesTargetDataset(test_dataset, full_model, device, size=10000)
+    # Create datasets for SPD (using raw images as inputs)
+    train_target_dataset = ShapesFullModelDataset(train_dataset, target_model, device, size=50000)
+    eval_target_dataset = ShapesFullModelDataset(test_dataset, target_model, device, size=10000)
 
     train_spd_loader = DatasetGeneratedDataLoader(
         train_target_dataset, batch_size=128, shuffle=True
     )
     eval_spd_loader = DatasetGeneratedDataLoader(eval_target_dataset, batch_size=128, shuffle=False)
 
-    # Create SPD config
+    # Create SPD config - decompose all layers including conv
     spd_config = Config(
         wandb_project=wandb_project,
         seed=seed,
         n_mask_samples=1,
         ci_fn_type="linear",
-        ci_fn_hidden_dims=[256],
+        ci_fn_hidden_dims=[4],
         sigmoid_type="leaky_hard",
+        # Decompose all layers: conv1, conv2, fc1, fc2
         module_info=[
+            {"module_pattern": "conv1", "C": n_components},
+            {"module_pattern": "conv2", "C": n_components},
             {"module_pattern": "fc1", "C": n_components},
             {"module_pattern": "fc2", "C": n_components},
         ],
         use_delta_component=True,
         loss_metric_configs=[
             ImportanceMinimalityLossConfig(
-                coeff=5e-3,
+                coeff=5e-2,
                 pnorm=2.0,
                 p_anneal_start_frac=0.0,
                 p_anneal_final_p=0.5,
                 p_anneal_end_frac=0.5,
             ),
-            StochasticReconSubsetLossConfig(coeff=1.0),
-            StochasticReconLayerwiseLossConfig(coeff=1.0),
-            FaithfulnessLossConfig(coeff=1.0),
-            PGDReconSubsetLossConfig(
-                coeff=1.0,
-                init="random",
-                step_size=1.0,
-                n_steps=1,
-                mask_scope="unique_per_datapoint",
+            StochasticReconSubsetLossConfig(
+                coeff=1.0, routing=StaticProbabilityRoutingConfig(p=0.5)
             ),
+            # StochasticHiddenActsReconLossConfig(coeff=1.0),
+            # StochasticReconLayerwiseLossConfig(coeff=1.0),
+            FaithfulnessLossConfig(coeff=1.0),
+            # PGD loss disabled for conv layers - needs spatial dimension handling
+            # PGDReconSubsetLossConfig(
+            #     coeff=1.0,
+            #     init="random",
+            #     step_size=1.0,
+            #     n_steps=1,
+            #     mask_scope="unique_per_datapoint",
+            # ),
         ],
-        output_loss_type="kl",
+        output_loss_type="mse",
         lr_schedule=ScheduleConfig(start_val=spd_lr, fn_type="cosine", final_val_frac=0.0),
         steps=spd_steps,
-        batch_size=1024,
+        batch_size=256,
         gradient_accumulation_steps=1,
         faithfulness_warmup_steps=200,
         faithfulness_warmup_lr=0.01,
@@ -415,18 +413,13 @@ def main(
         slow_eval_on_first_step=True,
         save_freq=None,
         eval_metric_configs=[
-            PGDReconSubsetLossConfig(
-                init="random",
-                step_size=1.0,
-                n_steps=20,
-                mask_scope="unique_per_datapoint",
-            ),
+            # Several eval metrics disabled for conv layers - need spatial dimension handling
             CIMeanPerComponentConfig(),
-            CIHistogramsConfig(n_batches_accum=5),
-            ComponentActivationDensityConfig(),
+            # CIHistogramsConfig(n_batches_accum=5),  # Crashes with conv layers
+            # ComponentActivationDensityConfig(),  # May crash with conv layers
             CI_L0Config(groups=None),
-            UVPlotsConfig(identity_patterns=None, dense_patterns=None),
-            StochasticAccuracyLayerwiseConfig(),
+            # UVPlotsConfig(identity_patterns=None, dense_patterns=None),  # May crash
+            # StochasticAccuracyLayerwiseConfig(),  # May crash
         ],
         ci_alive_threshold=0.1,
         n_examples_until_dead=1000000,
@@ -461,7 +454,7 @@ def main(
 
     try:
         optimize(
-            target_model=mlp_model,
+            target_model=target_model,
             config=spd_config,
             device=device,
             train_loader=train_spd_loader,
@@ -479,17 +472,19 @@ def main(
     logger.info("  - SPD checkpoints: model_*.pth")
     logger.info("  - Config: final_config.yaml")
 
-    # Create visualizations
+    # Create visualizations for each decomposed layer
     logger.info("Creating component visualizations...")
-    plot_component_attribute_correlation(
-        out_dir=out_path,
-        mlp_model=mlp_model,
-        full_model=full_model,
-        test_dataset=test_dataset,
-        device=device,
-        spd_config=spd_config,
-        log_wandb=wandb_project is not None,
-    )
+    for layer_name in ["conv1", "conv2", "fc1", "fc2"]:
+        logger.info(f"Analyzing layer: {layer_name}")
+        plot_component_attribute_correlation(
+            out_dir=out_path,
+            target_model=target_model,
+            test_dataset=test_dataset,
+            device=device,
+            spd_config=spd_config,
+            log_wandb=wandb_project is not None,
+            layer_to_analyze=layer_name,
+        )
 
     logger.info("Visualizations complete!")
 
@@ -501,12 +496,12 @@ def main(
 
 def plot_component_attribute_correlation(
     out_dir: Path,
-    mlp_model: ShapesMLP,
-    full_model: MultiAttributeCNNSingleHead,
+    target_model: ShapesCNNWrapper,
     test_dataset: MultiAttributeShapesDataset,
     device: str,
     spd_config: Config,
     log_wandb: bool = False,
+    layer_to_analyze: str = "fc1",
 ) -> None:
     """Plot how components correlate with different attributes (shape/color/size).
 
@@ -517,17 +512,15 @@ def plot_component_attribute_correlation(
     final_checkpoint = out_dir / f"model_{spd_config.steps}.pth"
     if not final_checkpoint.exists():
         checkpoints = list(out_dir.glob("model_*.pth"))
-        if not checkpoints:
-            logger.warning("No checkpoint found. Skipping visualizations.")
-            return
+        assert checkpoints, f"No checkpoints found in {out_dir} after SPD training - pipeline bug"
         final_checkpoint = max(checkpoints, key=lambda p: int(p.stem.split("_")[1]))
 
-    mlp_model.eval()
-    mlp_model.requires_grad_(False)
+    target_model.eval()
+    target_model.requires_grad_(False)
 
-    module_path_info = expand_module_patterns(mlp_model, spd_config.all_module_info)
+    module_path_info = expand_module_patterns(target_model, spd_config.all_module_info)
     component_model = ComponentModel(
-        target_model=mlp_model,
+        target_model=target_model,
         module_path_info=module_path_info,
         ci_fn_type=spd_config.ci_fn_type,
         ci_fn_hidden_dims=spd_config.ci_fn_hidden_dims,
@@ -540,21 +533,22 @@ def plot_component_attribute_correlation(
     component_model.to(device)
     component_model.eval()
 
-    fc1_components = component_model.components.get("fc1")
-    if fc1_components is None:
-        logger.warning("fc1 components not found.")
+    layer_components = component_model.components.get(layer_to_analyze)
+    if layer_components is None:
+        logger.warning(f"{layer_to_analyze} components not found.")
+        logger.info(f"Available layers: {list(component_model.components.keys())}")
         return
 
-    C = fc1_components.V.shape[1]
+    C = layer_components.V.shape[1]
+    is_conv_layer = layer_to_analyze.startswith("conv")
 
     # Collect component activations for each attribute value
-    attr_activations = {
+    attr_activations: dict[str, dict[int, list]] = {
         "shape": {i: [] for i in range(3)},  # circle, square, triangle
         "color": {i: [] for i in range(3)},  # red, green, blue
         "size": {i: [] for i in range(2)},  # small, large
     }
 
-    full_model.eval()
     component_model.eval()
 
     with torch.no_grad():
@@ -562,15 +556,36 @@ def plot_component_attribute_correlation(
             image, labels = test_dataset[idx]
             image = image.unsqueeze(0).to(device)
 
-            # Get conv features
-            x = full_model.pool(F.relu(full_model.conv1(image)))
-            x = full_model.pool(F.relu(full_model.conv2(x)))
-            x = full_model.pool(F.relu(full_model.conv3(x)))
-            conv_features = x.view(1, -1)
+            # Get pre-weight activations for the layer we're analyzing
+            # For conv layers, input is the previous layer's output
+            # For fc1, input is flattened conv2 output
+            # For fc2, input is relu(fc1 output)
+            if layer_to_analyze == "conv1":
+                pre_weight_input = image
+            elif layer_to_analyze == "conv2":
+                x = target_model.pool(F.relu(target_model.conv1(image)))
+                pre_weight_input = x
+            elif layer_to_analyze == "fc1":
+                x = target_model.pool(F.relu(target_model.conv1(image)))
+                x = target_model.pool(F.relu(target_model.conv2(x)))
+                pre_weight_input = x.reshape(1, -1)
+            else:  # fc2
+                x = target_model.pool(F.relu(target_model.conv1(image)))
+                x = target_model.pool(F.relu(target_model.conv2(x)))
+                x = x.reshape(1, -1)
+                pre_weight_input = F.relu(target_model.fc1(x))
 
             # Get component activations
-            component_acts = fc1_components.get_component_acts(conv_features)
-            component_acts = component_acts[0].cpu().numpy()
+            component_acts = layer_components.get_component_acts(pre_weight_input)
+
+            # For conv layers, component_acts has shape (batch, H, W, C)
+            # Aggregate over spatial dimensions by taking mean
+            if is_conv_layer:
+                # Shape: (1, H, W, C) -> (C,) by taking mean over spatial dims
+                component_acts = component_acts[0].mean(dim=(0, 1)).cpu().numpy()
+            else:
+                # Shape: (1, C) -> (C,)
+                component_acts = component_acts[0].cpu().numpy()
 
             # Store by attribute
             for attr in ["shape", "color", "size"]:
@@ -604,16 +619,22 @@ def plot_component_attribute_correlation(
         ax.set_title(f"Avg Component Activation by {attr.capitalize()}")
         plt.colorbar(im, ax=ax)
 
-    plt.suptitle("Component-Attribute Correlations (fc1)", fontsize=14)
+    plt.suptitle(f"Component-Attribute Correlations ({layer_to_analyze})", fontsize=14)
     plt.tight_layout()
 
-    corr_path = out_dir / "component_attribute_correlation.png"
+    corr_path = out_dir / f"component_attribute_correlation_{layer_to_analyze}.png"
     plt.savefig(corr_path, dpi=150, bbox_inches="tight")
     plt.close()
     logger.info(f"Saved correlation plot to {corr_path}")
 
     if log_wandb:
-        wandb.log({"visualizations/component_attribute_correlation": wandb.Image(str(corr_path))})
+        wandb.log(
+            {
+                f"visualizations/{layer_to_analyze}/component_attribute_correlation": wandb.Image(
+                    str(corr_path)
+                )
+            }
+        )
 
     # Compute and plot selectivity: which components are selective for which attribute?
     plot_component_selectivity(
@@ -621,6 +642,7 @@ def plot_component_attribute_correlation(
         out_dir=out_dir,
         attr_labels=attr_labels,
         log_wandb=log_wandb,
+        layer_name=layer_to_analyze,
     )
 
 
@@ -629,6 +651,7 @@ def plot_component_selectivity(
     out_dir: Path,
     attr_labels: dict,
     log_wandb: bool = False,
+    layer_name: str = "fc1",
 ) -> None:
     """Identify which components are most selective for each attribute type.
 
@@ -694,19 +717,25 @@ def plot_component_selectivity(
     ax.set_ylabel("Selectivity")
     ax.set_title(f"Top {top_k} Size-Selective Components")
 
-    plt.suptitle("Component Selectivity Analysis", fontsize=14)
+    plt.suptitle(f"Component Selectivity Analysis ({layer_name})", fontsize=14)
     plt.tight_layout()
 
-    selectivity_path = out_dir / "component_selectivity.png"
+    selectivity_path = out_dir / f"component_selectivity_{layer_name}.png"
     plt.savefig(selectivity_path, dpi=150, bbox_inches="tight")
     plt.close()
     logger.info(f"Saved selectivity plot to {selectivity_path}")
 
     if log_wandb:
-        wandb.log({"visualizations/component_selectivity": wandb.Image(str(selectivity_path))})
+        wandb.log(
+            {
+                f"visualizations/{layer_name}/component_selectivity": wandb.Image(
+                    str(selectivity_path)
+                )
+            }
+        )
 
     # Print summary
-    logger.info("\n=== Component Selectivity Summary ===")
+    logger.info(f"\n=== Component Selectivity Summary ({layer_name}) ===")
     logger.info(f"Top shape-selective components: {list(top_shape)}")
     logger.info(f"Top color-selective components: {list(top_color)}")
     logger.info(f"Top size-selective components: {list(top_size)}")
