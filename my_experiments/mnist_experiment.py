@@ -181,10 +181,10 @@ def main(
     spd_steps: int = 200000,
     spd_lr: float = 0.001,
     spd_weight_decay: float = 0.0,
-    spd_l1_penalty: float = 3.0,
+    spd_l1_penalty: float = 100.0,
     n_components: int = 500,
     seed: int = 42,
-    output_dir: str | None = "output/mnist_experiment_v2",
+    output_dir: str | None = "output/mnist_experiment_v3",
     wandb_project: str | None = "mnist_experiment",
 ) -> None:
     """Main experiment function.

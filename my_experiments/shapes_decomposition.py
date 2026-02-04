@@ -28,6 +28,7 @@ from spd.configs import (
     ImportanceMinimalityLossConfig,
     # PGDReconSubsetLossConfig,  # Disabled for conv layers
     ScheduleConfig,
+    StaticProbabilityRoutingConfig,
     StochasticReconSubsetLossConfig,
     TMSTaskConfig,
 )
@@ -381,7 +382,9 @@ def main(
                 p_anneal_final_p=0.5,
                 p_anneal_end_frac=0.5,
             ),
-            StochasticReconSubsetLossConfig(coeff=1.0),
+            StochasticReconSubsetLossConfig(
+                coeff=1.0, routing=StaticProbabilityRoutingConfig(p=0.5)
+            ),
             # StochasticHiddenActsReconLossConfig(coeff=1.0),
             # StochasticReconLayerwiseLossConfig(coeff=1.0),
             FaithfulnessLossConfig(coeff=1.0),

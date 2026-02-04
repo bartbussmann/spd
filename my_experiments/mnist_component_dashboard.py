@@ -191,45 +191,66 @@ class ComponentDashboard:
             self.pre_sigmoid_ci_fc2 = np.array(self.pre_sigmoid_ci_fc2)
 
     def get_component_direction_plot(self, layer: str, component_idx: int):
-        """Plot the component direction in input/output space."""
+        """Plot both V and U directions for a component.
+
+        For fc1: V is input space (784 -> 28x28 image), U is hidden space (128-dim bar)
+        For fc2: V is hidden space (128-dim bar), U is output space (10 classes bar)
+        """
         if layer not in self.component_model.components:
             return None
 
         component = self.component_model.components[layer]
-        V = component.V.detach().cpu().numpy()
-        U = component.U.detach().cpu().numpy()
+        V = component.V.detach().cpu().numpy()  # Shape: (d_in, C)
+        U = component.U.detach().cpu().numpy()  # Shape: (C, d_out)
 
         if component_idx >= V.shape[1]:
             return None
 
-        fig, ax = plt.subplots(figsize=(6, 6))
+        v_dir = V[:, component_idx]  # Input direction
+        u_dir = U[component_idx, :]  # Output direction
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
         if layer == "fc1":
-            # For fc1, show V direction (input space) as 28x28 image
-            direction = V[:, component_idx]
-            direction_img = direction.reshape(28, 28)
-            # Use symmetric colormap centered at 0 to show positive/negative contributions
-            abs_max = max(abs(direction_img.min()), abs(direction_img.max()))
+            # V: 784-dim -> 28x28 image (input space)
+            v_img = v_dir.reshape(28, 28)
+            abs_max = max(abs(v_img.min()), abs(v_img.max()))
             if abs_max < 1e-6:
-                abs_max = 1.0  # Avoid division by zero for dead components
+                abs_max = 1.0
+            im = axes[0].imshow(v_img, cmap="RdBu_r", vmin=-abs_max, vmax=abs_max)
+            axes[0].set_title("V: Input Space (784-dim as 28x28)")
+            axes[0].axis("off")
+            plt.colorbar(im, ax=axes[0], fraction=0.046)
 
-            im = ax.imshow(direction_img, cmap="RdBu_r", vmin=-abs_max, vmax=abs_max)
-            ax.set_title(f"{layer} - Component {component_idx}\nDirection in Input Space (V)")
-            plt.colorbar(im, ax=ax, label="Weight value")
-            ax.axis("off")
-        else:
-            # For fc2, show U direction (output space = 10 classes)
-            direction = U[component_idx, :]  # U shape is (C, d_out)
+            # U: 128-dim bar chart (hidden space)
+            axes[1].bar(range(len(u_dir)), u_dir, color="steelblue", alpha=0.7)
+            axes[1].set_xlabel("Hidden Unit Index")
+            axes[1].set_ylabel("Weight")
+            axes[1].set_title(f"U: Hidden Space ({len(u_dir)}-dim)")
+            axes[1].grid(axis="y", alpha=0.3)
+            axes[1].axhline(0, color="black", linewidth=0.5)
+
+        else:  # fc2
+            # V: 128-dim bar chart (hidden space)
+            axes[0].bar(range(len(v_dir)), v_dir, color="steelblue", alpha=0.7)
+            axes[0].set_xlabel("Hidden Unit Index")
+            axes[0].set_ylabel("Weight")
+            axes[0].set_title(f"V: Hidden Space ({len(v_dir)}-dim)")
+            axes[0].grid(axis="y", alpha=0.3)
+            axes[0].axhline(0, color="black", linewidth=0.5)
+
+            # U: 10-dim bar chart (output space = classes)
             colors = plt.cm.tab10(np.arange(10))
-            ax.bar(range(10), direction, color=colors)
-            ax.set_xlabel("Output Class")
-            ax.set_ylabel("Weight")
-            ax.set_xticks(range(10))
-            ax.set_xticklabels([str(i) for i in range(10)])
-            ax.set_title(f"{layer} - Component {component_idx}\nDirection in Output Space (U)")
-            ax.grid(axis="y", alpha=0.3)
-            ax.axhline(0, color="black", linewidth=0.5)
+            axes[1].bar(range(10), u_dir, color=colors)
+            axes[1].set_xlabel("Output Class")
+            axes[1].set_ylabel("Weight")
+            axes[1].set_xticks(range(10))
+            axes[1].set_xticklabels([str(i) for i in range(10)])
+            axes[1].set_title("U: Output Space (10 classes)")
+            axes[1].grid(axis="y", alpha=0.3)
+            axes[1].axhline(0, color="black", linewidth=0.5)
 
+        plt.suptitle(f"{layer} - Component {component_idx}", fontsize=14)
         plt.tight_layout()
         return fig
 

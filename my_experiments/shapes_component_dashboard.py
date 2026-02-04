@@ -8,54 +8,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from shapes_colours_dataset import MultiAttributeShapesDataset
+from shapes_colours_dataset import MultiAttributeCNNSingleHead, MultiAttributeShapesDataset
 
 from spd.configs import Config
 from spd.models.component_model import ComponentModel
 from spd.utils.module_utils import expand_module_patterns
-
-
-class MultiAttributeCNNSingleHead(nn.Module):
-    """CNN for multi-attribute classification (same as in shapes_colours_dataset.py)."""
-
-    def __init__(
-        self,
-        img_size: int = 32,
-        hidden_dim: int = 64,
-        n_shapes: int = 3,
-        n_colors: int = 3,
-        n_sizes: int = 2,
-    ):
-        super().__init__()
-        self.img_size = img_size
-        self.n_shapes = n_shapes
-        self.n_colors = n_colors
-        self.n_sizes = n_sizes
-
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool2d(2, 2)
-
-        self.flat_size = 64 * (img_size // 8) * (img_size // 8)
-
-        self.fc1 = nn.Linear(self.flat_size, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, n_shapes + n_colors + n_sizes)
-
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = self.pool(F.relu(self.conv3(x)))
-
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        logits = self.fc2(x)
-
-        return {
-            "shape": logits[:, : self.n_shapes],
-            "color": logits[:, self.n_shapes : self.n_shapes + self.n_colors],
-            "size": logits[:, -self.n_sizes :],
-        }
 
 
 class ShapesCNNWrapper(nn.Module):
@@ -64,55 +21,30 @@ class ShapesCNNWrapper(nn.Module):
     SPD requires models to output a single tensor, not a dict.
     """
 
-    def __init__(
-        self,
-        img_size: int = 32,
-        hidden_dim: int = 64,
-        n_shapes: int = 3,
-        n_colors: int = 3,
-        n_sizes: int = 2,
-    ):
+    def __init__(self, model: MultiAttributeCNNSingleHead):
         super().__init__()
-        self.img_size = img_size
-        self.n_shapes = n_shapes
-        self.n_colors = n_colors
-        self.n_sizes = n_sizes
+        # Expose the model's layers directly so SPD can target them
+        self.conv1 = model.conv1
+        self.conv2 = model.conv2
+        self.pool = model.pool
+        self.fc1 = model.fc1
+        self.fc2 = model.fc2
 
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool2d(2, 2)
-
-        self.flat_size = 64 * (img_size // 8) * (img_size // 8)
-
-        self.fc1 = nn.Linear(self.flat_size, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, n_shapes + n_colors + n_sizes)
+        # Keep metadata for reference
+        self.n_shapes = model.n_shapes
+        self.n_colors = model.n_colors
+        self.n_sizes = model.n_sizes
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Conv backbone
         x = self.pool(F.relu(self.conv1(x)))
         x = self.pool(F.relu(self.conv2(x)))
-        x = self.pool(F.relu(self.conv3(x)))
-        x = x.view(x.size(0), -1)
+
+        # Flatten and MLP
+        x = x.reshape(x.size(0), -1)
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
         return x
-
-    @staticmethod
-    def from_multi_attribute_cnn(cnn: MultiAttributeCNNSingleHead) -> "ShapesCNNWrapper":
-        """Create a wrapper by copying weights from a MultiAttributeCNNSingleHead."""
-        wrapper = ShapesCNNWrapper(
-            img_size=cnn.img_size,
-            hidden_dim=cnn.fc1.out_features,
-            n_shapes=cnn.n_shapes,
-            n_colors=cnn.n_colors,
-            n_sizes=cnn.n_sizes,
-        )
-        wrapper.conv1.load_state_dict(cnn.conv1.state_dict())
-        wrapper.conv2.load_state_dict(cnn.conv2.state_dict())
-        wrapper.conv3.load_state_dict(cnn.conv3.state_dict())
-        wrapper.fc1.load_state_dict(cnn.fc1.state_dict())
-        wrapper.fc2.load_state_dict(cnn.fc2.state_dict())
-        return wrapper
 
 
 # Attribute labels
@@ -152,7 +84,7 @@ class ShapesComponentDashboard:
         self.cnn_model.requires_grad_(False)
 
         # Create the wrapper model (same architecture used for decomposition)
-        self.target_model = ShapesCNNWrapper.from_multi_attribute_cnn(self.cnn_model)
+        self.target_model = ShapesCNNWrapper(self.cnn_model)
         self.target_model = self.target_model.to(device)
         self.target_model.eval()
         self.target_model.requires_grad_(False)
@@ -205,20 +137,15 @@ class ShapesComponentDashboard:
         if "conv2" in self.component_model.components:
             pre_weight_acts["conv2"] = x1
 
-        # Conv3 input is pool(relu(conv2(...)))
+        # FC1 input is flattened conv2 output
         x2 = model.pool(F.relu(model.conv2(x1)))
-        if "conv3" in self.component_model.components:
-            pre_weight_acts["conv3"] = x2
-
-        # FC1 input is flattened conv3 output
-        x3 = model.pool(F.relu(model.conv3(x2)))
-        x3_flat = x3.view(x3.size(0), -1)
+        x2_flat = x2.reshape(x2.size(0), -1)
         if "fc1" in self.component_model.components:
-            pre_weight_acts["fc1"] = x3_flat
+            pre_weight_acts["fc1"] = x2_flat
 
         # FC2 input is relu(fc1(...))
         if "fc2" in self.component_model.components:
-            pre_weight_acts["fc2"] = F.relu(model.fc1(x3_flat))
+            pre_weight_acts["fc2"] = F.relu(model.fc1(x2_flat))
 
         return pre_weight_acts
 
@@ -255,7 +182,12 @@ class ShapesComponentDashboard:
                 for layer_name, component in self.component_model.components.items():
                     if layer_name in pre_weight_acts:
                         acts = component.get_component_acts(pre_weight_acts[layer_name])
-                        self.activations[layer_name].append(acts[0].cpu().numpy())
+                        # For conv layers, acts has shape (batch, H, W, C) - aggregate over spatial dims
+                        # For fc layers, acts has shape (batch, C)
+                        acts_np = acts[0].cpu().numpy()
+                        if acts_np.ndim == 3:  # Conv layer: (H, W, C)
+                            acts_np = acts_np.mean(axis=(0, 1))  # -> (C,)
+                        self.activations[layer_name].append(acts_np)
 
                 # Get causal importance
                 ci_outputs = self.component_model.calc_causal_importances(
@@ -267,13 +199,15 @@ class ShapesComponentDashboard:
                 # Store CI values for each layer
                 for layer_name in self.component_model.components:
                     if layer_name in ci_outputs.lower_leaky:
-                        self.causal_importance[layer_name].append(
-                            ci_outputs.lower_leaky[layer_name][0].cpu().numpy()
-                        )
+                        ci_np = ci_outputs.lower_leaky[layer_name][0].cpu().numpy()
+                        if ci_np.ndim == 3:  # Conv layer: (H, W, C)
+                            ci_np = ci_np.mean(axis=(0, 1))  # -> (C,)
+                        self.causal_importance[layer_name].append(ci_np)
                     if layer_name in ci_outputs.pre_sigmoid:
-                        self.pre_sigmoid_ci[layer_name].append(
-                            ci_outputs.pre_sigmoid[layer_name][0].cpu().numpy()
-                        )
+                        pre_sig_np = ci_outputs.pre_sigmoid[layer_name][0].cpu().numpy()
+                        if pre_sig_np.ndim == 3:  # Conv layer: (H, W, C)
+                            pre_sig_np = pre_sig_np.mean(axis=(0, 1))  # -> (C,)
+                        self.pre_sigmoid_ci[layer_name].append(pre_sig_np)
 
         self.test_images = np.array(self.test_images)
         for attr in ["shape", "color", "size"]:
